@@ -150,6 +150,28 @@ function summarize(rows) {
   };
 }
 
+function getAtomicCategoryCounts(rows) {
+  // Rincian per kelompok populasi (bukan hanya SPM/Non-SPM), khusus untuk file unduhan.
+  const set = new Set();
+  rows.forEach((r) => {
+    if (r.kelompokPopulasi) {
+      r.kelompokPopulasi.split(",").forEach((p) => {
+        const t = p.trim();
+        if (t) set.add(t);
+      });
+    }
+  });
+  const cats = Array.from(set).sort((a, b) => {
+    const countA = rows.filter((r) => r.kelompokPopulasi.includes(a)).length;
+    const countB = rows.filter((r) => r.kelompokPopulasi.includes(b)).length;
+    return countB - countA;
+  });
+  return cats.map((cat) => ({
+    cat,
+    count: rows.filter((r) => r.kelompokPopulasi.includes(cat)).length,
+  }));
+}
+
 function buildWorkbook(parsed, summary) {
   const wb = XLSX.utils.book_new();
 
@@ -187,6 +209,16 @@ function buildWorkbook(parsed, summary) {
   ];
   const wsPop = XLSX.utils.aoa_to_sheet(popAoa);
   XLSX.utils.book_append_sheet(wb, wsPop, "Rekap Kelompok Populasi");
+
+  // Sheet 4: Detail per Kelompok Populasi (rincian, khusus file unduhan)
+  const atomicCounts = getAtomicCategoryCounts(parsed.rows);
+  const detailAoa = [["No", "Kelompok Populasi", "Jumlah Tes", "% dari Total Baris Data"]];
+  atomicCounts.forEach((c, i) => {
+    detailAoa.push([i + 1, c.cat, c.count, summary.total ? c.count / summary.total : 0]);
+  });
+  detailAoa.push([null, "TOTAL BARIS DATA", summary.total, null]);
+  const wsDetail = XLSX.utils.aoa_to_sheet(detailAoa);
+  XLSX.utils.book_append_sheet(wb, wsDetail, "Detail Kelompok Populasi");
 
   return wb;
 }
@@ -540,7 +572,7 @@ export default function App() {
 
             <div style={{ fontSize: 11.5, color: COLOR.inkSoft, marginTop: 12, lineHeight: 1.5 }}>
               Capaian SPM dihitung dari seluruh kelompok populasi di luar Calon Pengantin.
-              File yang diunduh berisi 3 sheet: Data (mentah + kategori SPM), Rekap per Layanan, dan Rekap Kelompok Populasi.
+              File yang diunduh berisi 4 sheet: Data (mentah + kategori SPM), Rekap per Layanan, Rekap Kelompok Populasi (SPM/Non-SPM), dan Detail Kelompok Populasi (rincian per kelompok).
             </div>
           </>
         )}
