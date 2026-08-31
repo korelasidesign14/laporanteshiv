@@ -53,6 +53,151 @@ function isSPM(kp) {
   return SPM_GROUPS.some((g) => s.includes(g));
 }
 
+// ---------------------------------------------------------------------------
+// Target matching (Indikator Target per Layanan / Dinkes)
+// ---------------------------------------------------------------------------
+const ORG_STOPWORDS = new Set([
+  "PUSKESMAS", "RSUD", "RSIA", "RSK", "RS", "KLINIK", "PRATAMA", "KABUPATEN",
+]);
+
+function normalizeFacility(name) {
+  return String(name || "")
+    .toUpperCase()
+    .replace(/\./g, "")
+    .split(/[^A-Z0-9]+/)
+    .filter((w) => w && !ORG_STOPWORDS.has(w))
+    .join("");
+}
+
+function levenshtein(a, b) {
+  const m = a.length, n = b.length;
+  const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  for (let i = 0; i <= m; i++) dp[i][0] = i;
+  for (let j = 0; j <= n; j++) dp[0][j] = j;
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      dp[i][j] = a[i - 1] === b[j - 1] ? dp[i - 1][j - 1] : 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
+    }
+  }
+  return dp[m][n];
+}
+
+function parseTargetSheet(aoa) {
+  let headerRow = -1;
+  for (let i = 0; i < Math.min(aoa.length, 40); i++) {
+    const row = aoa[i] || [];
+    if (row.some((c) => c != null && String(c).trim() === "PUSKESMAS")) {
+      headerRow = i;
+      break;
+    }
+  }
+  if (headerRow === -1) return null;
+  const mainHeader = aoa[headerRow] || [];
+  const subHeader = aoa[headerRow + 1] || [];
+  const colMap = {};
+  mainHeader.forEach((c, idx) => {
+    if (c != null && String(c).trim() !== "") colMap[String(c).trim().toUpperCase()] = idx;
+  });
+  const subLabels = ["BUMIL", "TB", "WARIA", "PENASUN", "WPS", "LSL", "WB"];
+  subHeader.forEach((c, idx) => {
+    if (c != null) {
+      const label = String(c).trim().toUpperCase();
+      if (subLabels.includes(label) && !(label in colMap)) colMap[label] = idx;
+    }
+  });
+  if (!("PUSKESMAS" in colMap)) return null;
+
+  const rows = [];
+  for (let i = headerRow + 2; i < aoa.length; i++) {
+    const row = aoa[i] || [];
+    const nameRaw = row[colMap["PUSKESMAS"]];
+    if (nameRaw == null) continue;
+    const name = String(nameRaw).trim();
+    if (!name || /^jumlah$/i.test(name)) continue;
+    const num = (key) => {
+      const v = colMap[key] != null ? row[colMap[key]] : null;
+      const n = Number(v);
+      return isNaN(n) ? 0 : n;
+    };
+    const bumil = num("BUMIL"), tb = num("TB"), waria = num("WARIA"),
+      penasun = num("PENASUN"), wps = num("WPS"), lsl = num("LSL"), wb = num("WB");
+    let total = num("TOTAL TARGET");
+    if (!total) total = bumil + tb + waria + penasun + wps + lsl + wb;
+    if (!total) continue;
+    rows.push({ name, bumil, tb, waria, penasun, wps, lsl, wb, total });
+  }
+  return rows;
+}
+
+function parseTargetWorkbook(wb) {
+  let best = null;
+  let bestYear = -1;
+  for (const sheetName of wb.SheetNames) {
+    const ws = wb.Sheets[sheetName];
+    const aoa = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null, blankrows: true });
+    const rows = parseTargetSheet(aoa);
+    if (!rows || rows.length === 0) continue;
+    let year = 0;
+    for (let i = 0; i < Math.min(aoa.length, 6); i++) {
+      const text = (aoa[i] || []).map((c) => (c == null ? "" : String(c))).join(" ");
+      const m = text.match(/20\d{2}/);
+      if (m) year = Math.max(year, Number(m[0]));
+    }
+    if (year >= bestYear) { bestYear = year; best = rows; }
+  }
+  if (!best) {
+    throw new Error(
+      "Format target tidak dikenali: tidak ditemukan kolom 'PUSKESMAS' pada file. Pastikan file target sesuai format standar (ada kolom PUSKESMAS dan TOTAL TARGET)."
+    );
+  }
+  return best;
+}
+
+function facilityType(name) {
+  const s = String(name || "").trim().toUpperCase();
+  if (/^(RSUD|RSIA|RSK|RS)\b/.test(s)) return "RS";
+  if (/^PUSKESMAS\b/.test(s)) return "PUSKESMAS";
+  return "OTHER";
+}
+
+function matchTargetsToFacilities(targetRows, facilityNames) {
+  const regKeys = facilityNames.map((n) => ({ raw: n, key: normalizeFacility(n), type: facilityType(n) }));
+  const byFacility = new Map();
+  const unmatched = [];
+  for (const t of targetRows) {
+    const tKey = normalizeFacility(t.name);
+    if (!tKey) continue;
+    const tType = facilityType(t.name);
+    // Batasi kandidat ke tipe yang sama (RS hanya dicocokkan ke RS; selain itu ke Puskesmas/lainnya)
+    // supaya nama pendek seperti "KARAWANG" tidak salah nyantol ke "RSUD Karawang".
+    const candidates = tType === "RS" ? regKeys.filter((r) => r.type === "RS") : regKeys.filter((r) => r.type !== "RS");
+    let match = candidates.find((r) => r.key === tKey);
+    if (!match) match = candidates.find((r) => r.key === tKey + "KARAWANG");
+    if (!match) {
+      const contains = candidates.filter((r) => tKey.length >= 4 && r.key.includes(tKey));
+      if (contains.length === 1) match = contains[0];
+    }
+    if (!match) {
+      let bestR = null, bestDist = Infinity, secondDist = Infinity;
+      for (const r of candidates) {
+        const d = levenshtein(tKey, r.key);
+        if (d < bestDist) { secondDist = bestDist; bestDist = d; bestR = r; }
+        else if (d < secondDist) secondDist = d;
+      }
+      if (bestR && bestDist <= 4 && bestDist < secondDist) match = bestR;
+    }
+    if (match) {
+      const cur = byFacility.get(match.raw) || { bumil: 0, tb: 0, waria: 0, penasun: 0, wps: 0, lsl: 0, wb: 0, total: 0 };
+      cur.bumil += t.bumil; cur.tb += t.tb; cur.waria += t.waria; cur.penasun += t.penasun;
+      cur.wps += t.wps; cur.lsl += t.lsl; cur.wb += t.wb; cur.total += t.total;
+      byFacility.set(match.raw, cur);
+    } else {
+      unmatched.push(t.name);
+    }
+  }
+  return { byFacility, unmatched };
+}
+
 function findMeta(aoa) {
   // Scans the first ~10 rows for label/value pairs like "Provinsi" | "Jawa Barat"
   const wanted = ["Provinsi", "Kabupaten/Kota", "Periode"];
@@ -172,7 +317,7 @@ function getAtomicCategoryCounts(rows) {
   }));
 }
 
-function buildWorkbook(parsed, summary) {
+function buildWorkbook(parsed, summary, targetInfo) {
   const wb = XLSX.utils.book_new();
 
   // Sheet 1: Data (raw + helper column)
@@ -220,6 +365,19 @@ function buildWorkbook(parsed, summary) {
   const wsDetail = XLSX.utils.aoa_to_sheet(detailAoa);
   XLSX.utils.book_append_sheet(wb, wsDetail, "Detail Kelompok Populasi");
 
+  // Sheet 5: Capaian vs Target (hanya jika file target diunggah)
+  if (targetInfo && targetInfo.targetRows && targetInfo.targetRows.length) {
+    const { byFacility, totalTargetAll } = targetInfo;
+    const targetAoa = [["No", "Nama UPK / Layanan", "Total Tes", "Target", "% Capaian"]];
+    summary.perLayanan.forEach((r, i) => {
+      const t = byFacility.get(r.upk);
+      targetAoa.push([i + 1, r.upk, r.total, t ? t.total : null, t && t.total ? r.total / t.total : null]);
+    });
+    targetAoa.push([null, "TOTAL DINKES (KABUPATEN)", summary.total, totalTargetAll, totalTargetAll ? summary.total / totalTargetAll : null]);
+    const wsTarget = XLSX.utils.aoa_to_sheet(targetAoa);
+    XLSX.utils.book_append_sheet(wb, wsTarget, "Capaian vs Target");
+  }
+
   return wb;
 }
 
@@ -232,6 +390,19 @@ function CoverageRail({ spm, total, height = 8, width = 90 }) {
     <div style={{ width, height, borderRadius: height / 2, overflow: "hidden", background: COLOR.greySoft, display: "flex" }}>
       <div style={{ width: `${pct * 100}%`, background: COLOR.teal }} />
       <div style={{ flex: 1, background: COLOR.grey, opacity: 0.35 }} />
+    </div>
+  );
+}
+
+function CapaianBar({ capaian, height = 8, width = 90 }) {
+  if (capaian == null) {
+    return <div style={{ width, height, borderRadius: height / 2, background: COLOR.greySoft }} />;
+  }
+  const color = capaian >= 1 ? COLOR.teal : capaian >= 0.75 ? COLOR.amber : COLOR.coral;
+  const fillPct = Math.min(capaian, 1) * 100;
+  return (
+    <div style={{ width, height, borderRadius: height / 2, overflow: "hidden", background: COLOR.greySoft, position: "relative" }}>
+      <div style={{ width: `${fillPct}%`, height: "100%", background: color }} />
     </div>
   );
 }
@@ -267,6 +438,12 @@ export default function App() {
   const [query, setQuery] = useState("");
   const [dragOver, setDragOver] = useState(false);
   const fileInputRef = useRef(null);
+
+  const [targetRows, setTargetRows] = useState(null);
+  const [targetFileName, setTargetFileName] = useState("");
+  const [targetError, setTargetError] = useState("");
+  const [targetLoading, setTargetLoading] = useState(false);
+  const targetInputRef = useRef(null);
 
   const handleFile = useCallback((file) => {
     if (!file) return;
@@ -306,9 +483,59 @@ export default function App() {
     handleFile(file);
   }, [handleFile]);
 
+  const handleTargetFile = useCallback((file) => {
+    if (!file) return;
+    setTargetError("");
+    setTargetLoading(true);
+    setTargetFileName(file.name);
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const data = new Uint8Array(e.target.result);
+        const wb = XLSX.read(data, { type: "array", cellDates: true });
+        const rows = parseTargetWorkbook(wb);
+        setTargetRows(rows);
+      } catch (err) {
+        setTargetError(err.message || "Gagal membaca file target.");
+        setTargetRows(null);
+      } finally {
+        setTargetLoading(false);
+      }
+    };
+    reader.onerror = () => {
+      setTargetError("Gagal membaca file target.");
+      setTargetLoading(false);
+    };
+    reader.readAsArrayBuffer(file);
+  }, []);
+
+  const resetTarget = () => {
+    setTargetRows(null);
+    setTargetFileName("");
+    setTargetError("");
+    if (targetInputRef.current) targetInputRef.current.value = "";
+  };
+
+  const targetMatch = useMemo(() => {
+    if (!targetRows || !summary) return null;
+    const { byFacility, unmatched } = matchTargetsToFacilities(targetRows, summary.perLayanan.map((r) => r.upk));
+    const totalTargetAll = targetRows.reduce((s, t) => s + t.total, 0);
+    return { byFacility, unmatched, totalTargetAll };
+  }, [targetRows, summary]);
+
+  const enrichedRows = useMemo(() => {
+    if (!summary) return [];
+    return summary.perLayanan.map((r) => {
+      const t = targetMatch ? targetMatch.byFacility.get(r.upk) : null;
+      const target = t ? t.total : null;
+      const capaian = target ? r.total / target : null;
+      return { ...r, target, capaian };
+    });
+  }, [summary, targetMatch]);
+
   const sortedRows = useMemo(() => {
     if (!summary) return [];
-    let rows = summary.perLayanan;
+    let rows = enrichedRows;
     if (query.trim()) {
       const q = query.trim().toLowerCase();
       rows = rows.filter((r) => r.upk.toLowerCase().includes(q));
@@ -316,9 +543,11 @@ export default function App() {
     const dir = sortDir === "asc" ? 1 : -1;
     return [...rows].sort((a, b) => {
       if (sortKey === "upk") return a.upk.localeCompare(b.upk) * dir;
-      return (a[sortKey] - b[sortKey]) * dir;
+      const av = a[sortKey], bv = b[sortKey];
+      const an = av == null ? -1 : av, bn = bv == null ? -1 : bv;
+      return (an - bn) * dir;
     });
-  }, [summary, sortKey, sortDir, query]);
+  }, [summary, enrichedRows, sortKey, sortDir, query]);
 
   const topChartData = useMemo(() => {
     if (!summary) return [];
@@ -338,7 +567,7 @@ export default function App() {
 
   const handleDownload = () => {
     if (!parsed || !summary) return;
-    const wb = buildWorkbook(parsed, summary);
+    const wb = buildWorkbook(parsed, summary, targetMatch ? { ...targetMatch, targetRows } : null);
     XLSX.writeFile(wb, `hasil_rekap_hiv_${(fileName || "data").replace(/\.[^/.]+$/, "")}.xlsx`);
   };
 
@@ -467,12 +696,101 @@ export default function App() {
               </div>
             )}
 
+            {/* Target upload (opsional) */}
+            <div style={{
+              marginTop: 14, border: `1px solid ${COLOR.line}`, borderRadius: 10,
+              background: COLOR.surface, padding: "12px 16px", display: "flex",
+              alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap",
+            }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <div style={{
+                  width: 30, height: 30, borderRadius: 7, background: COLOR.greySoft,
+                  display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0,
+                }}>
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke={COLOR.inkSoft} strokeWidth="2">
+                    <circle cx="12" cy="12" r="9" />
+                    <circle cx="12" cy="12" r="4.5" />
+                    <circle cx="12" cy="12" r="0.7" fill={COLOR.inkSoft} />
+                  </svg>
+                </div>
+                <div>
+                  <div style={{ fontWeight: 600, fontSize: 13 }}>
+                    {targetFileName ? targetFileName : "Indikator Target (opsional)"}
+                  </div>
+                  <div style={{ fontSize: 12, color: COLOR.inkSoft, marginTop: 1 }}>
+                    {targetLoading
+                      ? "Membaca target…"
+                      : targetMatch
+                      ? `${fmt(targetMatch.byFacility.size)} layanan cocok${targetMatch.unmatched.length ? `, ${fmt(targetMatch.unmatched.length)} tidak cocok` : ""}`
+                      : "Unggah file target Dinkes untuk melihat capaian per layanan"}
+                  </div>
+                </div>
+              </div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <input
+                  ref={targetInputRef}
+                  type="file"
+                  accept=".xlsx,.xls"
+                  style={{ display: "none" }}
+                  onChange={(e) => handleTargetFile(e.target.files[0])}
+                />
+                <button
+                  onClick={() => targetInputRef.current && targetInputRef.current.click()}
+                  style={{
+                    background: targetFileName ? "transparent" : COLOR.teal,
+                    color: targetFileName ? COLOR.inkSoft : "#fff",
+                    border: targetFileName ? `1px solid ${COLOR.line}` : "none",
+                    borderRadius: 7, padding: "7px 12px", fontSize: 12.5, fontWeight: 600, cursor: "pointer",
+                  }}
+                >
+                  {targetFileName ? "Ganti" : "Unggah Target"}
+                </button>
+                {targetFileName && (
+                  <button
+                    onClick={resetTarget}
+                    style={{
+                      background: "transparent", color: COLOR.inkSoft, border: `1px solid ${COLOR.line}`,
+                      borderRadius: 7, padding: "7px 12px", fontSize: 12.5, fontWeight: 600, cursor: "pointer",
+                    }}
+                  >
+                    Hapus
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {targetError && (
+              <div style={{
+                marginTop: 10, background: "#FBEAE6", border: `1px solid ${COLOR.coral}`, color: "#8A3624",
+                borderRadius: 8, padding: "10px 14px", fontSize: 13,
+              }}>
+                {targetError}
+              </div>
+            )}
+
+            {targetMatch && targetMatch.unmatched.length > 0 && (
+              <div style={{
+                marginTop: 10, background: "#FBF3E4", border: `1px solid ${COLOR.amber}`, color: "#7A5A17",
+                borderRadius: 8, padding: "10px 14px", fontSize: 12.5, lineHeight: 1.5,
+              }}>
+                {fmt(targetMatch.unmatched.length)} baris target tidak dapat dicocokkan otomatis ke nama layanan di data: {targetMatch.unmatched.slice(0, 8).join(", ")}{targetMatch.unmatched.length > 8 ? `, +${targetMatch.unmatched.length - 8} lainnya` : ""}.
+              </div>
+            )}
+
             {/* Stat cards */}
             <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginTop: 14 }}>
               <StatCard eyebrow="Total Tes HIV" value={fmt(summary.total)} sub={`${fmt(summary.layananCount)} layanan`} />
               <StatCard eyebrow="Capaian SPM" value={fmt(summary.totalSpm)} sub={pct(summary.totalSpm, summary.total) + " dari total"} accent={COLOR.teal} />
               <StatCard eyebrow="Non-SPM" value={fmt(summary.totalNonSpm)} sub="Calon Pengantin" accent={COLOR.grey} />
               <StatCard eyebrow="ODHIV Terkonfirmasi" value={fmt(summary.totalOdhiv)} sub={pct(summary.totalOdhiv, summary.total) + " dari total"} accent={COLOR.coral} />
+              {targetMatch && (
+                <StatCard
+                  eyebrow="Capaian Dinkes (Kabupaten)"
+                  value={pct(summary.total, targetMatch.totalTargetAll)}
+                  sub={`${fmt(summary.total)} / ${fmt(Math.round(targetMatch.totalTargetAll))} target`}
+                  accent={summary.total / targetMatch.totalTargetAll >= 1 ? COLOR.teal : summary.total / targetMatch.totalTargetAll >= 0.75 ? COLOR.amber : COLOR.coral}
+                />
+              )}
             </div>
 
             {/* Charts */}
@@ -552,6 +870,13 @@ export default function App() {
                       <th style={{ padding: "9px 12px", textAlign: "right" }} onClick={() => toggleSort("belumTahu")}>Belum Tahu{arrow("belumTahu")}</th>
                       <th style={{ padding: "9px 12px", textAlign: "right" }} onClick={() => toggleSort("spm")}>Capaian SPM{arrow("spm")}</th>
                       <th style={{ padding: "9px 12px" }}>Cakupan SPM</th>
+                      {targetMatch && (
+                        <>
+                          <th style={{ padding: "9px 12px", textAlign: "right" }} onClick={() => toggleSort("target")}>Target{arrow("target")}</th>
+                          <th style={{ padding: "9px 12px", textAlign: "right" }} onClick={() => toggleSort("capaian")}>% Capaian{arrow("capaian")}</th>
+                          <th style={{ padding: "9px 12px" }}>Capaian vs Target</th>
+                        </>
+                      )}
                     </tr>
                   </thead>
                   <tbody>
@@ -563,6 +888,20 @@ export default function App() {
                         <td style={{ padding: "8px 12px", textAlign: "right", fontFamily: MONO, color: COLOR.inkSoft }}>{fmt(r.belumTahu)}</td>
                         <td style={{ padding: "8px 12px", textAlign: "right", fontFamily: MONO }}>{fmt(r.spm)} <span style={{ color: COLOR.inkSoft }}>({pct(r.spm, r.total)})</span></td>
                         <td style={{ padding: "8px 12px" }}><CoverageRail spm={r.spm} total={r.total} /></td>
+                        {targetMatch && (
+                          <>
+                            <td style={{ padding: "8px 12px", textAlign: "right", fontFamily: MONO, color: r.target != null ? COLOR.ink : COLOR.inkSoft }}>
+                              {r.target != null ? fmt(Math.round(r.target)) : "–"}
+                            </td>
+                            <td style={{
+                              padding: "8px 12px", textAlign: "right", fontFamily: MONO, fontWeight: 600,
+                              color: r.capaian == null ? COLOR.inkSoft : r.capaian >= 1 ? COLOR.teal : r.capaian >= 0.75 ? COLOR.amber : COLOR.coral,
+                            }}>
+                              {r.capaian != null ? pct(r.total, r.target) : "–"}
+                            </td>
+                            <td style={{ padding: "8px 12px" }}><CapaianBar capaian={r.capaian} /></td>
+                          </>
+                        )}
                       </tr>
                     ))}
                   </tbody>
@@ -572,7 +911,9 @@ export default function App() {
 
             <div style={{ fontSize: 11.5, color: COLOR.inkSoft, marginTop: 12, lineHeight: 1.5 }}>
               Capaian SPM dihitung dari seluruh kelompok populasi di luar Calon Pengantin.
-              File yang diunduh berisi 4 sheet: Data (mentah + kategori SPM), Rekap per Layanan, Rekap Kelompok Populasi (SPM/Non-SPM), dan Detail Kelompok Populasi (rincian per kelompok).
+              {targetMatch
+                ? " File yang diunduh berisi 5 sheet: Data (mentah + kategori SPM), Rekap per Layanan, Rekap Kelompok Populasi, Detail Kelompok Populasi, dan Capaian vs Target."
+                : " File yang diunduh berisi 4 sheet: Data (mentah + kategori SPM), Rekap per Layanan, Rekap Kelompok Populasi, dan Detail Kelompok Populasi. Unggah file target di atas untuk menambahkan sheet Capaian vs Target."}
             </div>
           </>
         )}
