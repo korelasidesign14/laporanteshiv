@@ -365,17 +365,17 @@ function buildWorkbook(parsed, summary, targetInfo) {
   const wsDetail = XLSX.utils.aoa_to_sheet(detailAoa);
   XLSX.utils.book_append_sheet(wb, wsDetail, "Detail Kelompok Populasi");
 
-  // Sheet 5: Capaian vs Target (hanya jika file target diunggah)
+  // Sheet 5: Capaian SPM vs Target (hanya jika file target diunggah)
   if (targetInfo && targetInfo.targetRows && targetInfo.targetRows.length) {
     const { byFacility, totalTargetAll } = targetInfo;
-    const targetAoa = [["No", "Nama UPK / Layanan", "Total Tes", "Target", "% Capaian"]];
+    const targetAoa = [["No", "Nama UPK / Layanan", "Capaian SPM", "Target SPM", "% Capaian SPM"]];
     summary.perLayanan.forEach((r, i) => {
       const t = byFacility.get(r.upk);
-      targetAoa.push([i + 1, r.upk, r.total, t ? t.total : null, t && t.total ? r.total / t.total : null]);
+      targetAoa.push([i + 1, r.upk, r.spm, t ? t.total : null, t && t.total ? r.spm / t.total : null]);
     });
-    targetAoa.push([null, "TOTAL DINKES (KABUPATEN)", summary.total, totalTargetAll, totalTargetAll ? summary.total / totalTargetAll : null]);
+    targetAoa.push([null, "TOTAL DINKES (KABUPATEN)", summary.totalSpm, totalTargetAll, totalTargetAll ? summary.totalSpm / totalTargetAll : null]);
     const wsTarget = XLSX.utils.aoa_to_sheet(targetAoa);
-    XLSX.utils.book_append_sheet(wb, wsTarget, "Capaian vs Target");
+    XLSX.utils.book_append_sheet(wb, wsTarget, "Capaian SPM vs Target");
   }
 
   return wb;
@@ -528,7 +528,7 @@ export default function App() {
     return summary.perLayanan.map((r) => {
       const t = targetMatch ? targetMatch.byFacility.get(r.upk) : null;
       const target = t ? t.total : null;
-      const capaian = target ? r.total / target : null;
+      const capaian = target ? r.spm / target : null;
       return { ...r, target, capaian };
     });
   }, [summary, targetMatch]);
@@ -722,7 +722,7 @@ export default function App() {
                       ? "Membaca target…"
                       : targetMatch
                       ? `${fmt(targetMatch.byFacility.size)} layanan cocok${targetMatch.unmatched.length ? `, ${fmt(targetMatch.unmatched.length)} tidak cocok` : ""}`
-                      : "Unggah file target Dinkes untuk melihat capaian per layanan"}
+                      : "Unggah file target SPM Dinkes untuk melihat capaian per layanan"}
                   </div>
                 </div>
               </div>
@@ -785,10 +785,10 @@ export default function App() {
               <StatCard eyebrow="ODHIV Terkonfirmasi" value={fmt(summary.totalOdhiv)} sub={pct(summary.totalOdhiv, summary.total) + " dari total"} accent={COLOR.coral} />
               {targetMatch && (
                 <StatCard
-                  eyebrow="Capaian Dinkes (Kabupaten)"
-                  value={pct(summary.total, targetMatch.totalTargetAll)}
-                  sub={`${fmt(summary.total)} / ${fmt(Math.round(targetMatch.totalTargetAll))} target`}
-                  accent={summary.total / targetMatch.totalTargetAll >= 1 ? COLOR.teal : summary.total / targetMatch.totalTargetAll >= 0.75 ? COLOR.amber : COLOR.coral}
+                  eyebrow="Capaian Dinkes (Kabupaten) — SPM"
+                  value={pct(summary.totalSpm, targetMatch.totalTargetAll)}
+                  sub={`${fmt(summary.totalSpm)} / ${fmt(Math.round(targetMatch.totalTargetAll))} target SPM`}
+                  accent={summary.totalSpm / targetMatch.totalTargetAll >= 1 ? COLOR.teal : summary.totalSpm / targetMatch.totalTargetAll >= 0.75 ? COLOR.amber : COLOR.coral}
                 />
               )}
             </div>
@@ -872,9 +872,9 @@ export default function App() {
                       <th style={{ padding: "9px 12px" }}>Cakupan SPM</th>
                       {targetMatch && (
                         <>
-                          <th style={{ padding: "9px 12px", textAlign: "right" }} onClick={() => toggleSort("target")}>Target{arrow("target")}</th>
-                          <th style={{ padding: "9px 12px", textAlign: "right" }} onClick={() => toggleSort("capaian")}>% Capaian{arrow("capaian")}</th>
-                          <th style={{ padding: "9px 12px" }}>Capaian vs Target</th>
+                          <th style={{ padding: "9px 12px", textAlign: "right" }} onClick={() => toggleSort("target")}>Target SPM{arrow("target")}</th>
+                          <th style={{ padding: "9px 12px", textAlign: "right" }} onClick={() => toggleSort("capaian")}>% Capaian SPM{arrow("capaian")}</th>
+                          <th style={{ padding: "9px 12px" }}>Capaian SPM vs Target</th>
                         </>
                       )}
                     </tr>
@@ -897,7 +897,7 @@ export default function App() {
                               padding: "8px 12px", textAlign: "right", fontFamily: MONO, fontWeight: 600,
                               color: r.capaian == null ? COLOR.inkSoft : r.capaian >= 1 ? COLOR.teal : r.capaian >= 0.75 ? COLOR.amber : COLOR.coral,
                             }}>
-                              {r.capaian != null ? pct(r.total, r.target) : "–"}
+                              {r.capaian != null ? pct(r.spm, r.target) : "–"}
                             </td>
                             <td style={{ padding: "8px 12px" }}><CapaianBar capaian={r.capaian} /></td>
                           </>
@@ -912,8 +912,8 @@ export default function App() {
             <div style={{ fontSize: 11.5, color: COLOR.inkSoft, marginTop: 12, lineHeight: 1.5 }}>
               Capaian SPM dihitung dari seluruh kelompok populasi di luar Calon Pengantin.
               {targetMatch
-                ? " File yang diunduh berisi 5 sheet: Data (mentah + kategori SPM), Rekap per Layanan, Rekap Kelompok Populasi, Detail Kelompok Populasi, dan Capaian vs Target."
-                : " File yang diunduh berisi 4 sheet: Data (mentah + kategori SPM), Rekap per Layanan, Rekap Kelompok Populasi, dan Detail Kelompok Populasi. Unggah file target di atas untuk menambahkan sheet Capaian vs Target."}
+                ? " File yang diunduh berisi 5 sheet: Data (mentah + kategori SPM), Rekap per Layanan, Rekap Kelompok Populasi, Detail Kelompok Populasi, dan Capaian SPM vs Target."
+                : " File yang diunduh berisi 4 sheet: Data (mentah + kategori SPM), Rekap per Layanan, Rekap Kelompok Populasi, dan Detail Kelompok Populasi. Unggah file target di atas untuk menambahkan sheet Capaian SPM vs Target."}
             </div>
           </>
         )}
