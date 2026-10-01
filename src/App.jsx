@@ -2,7 +2,7 @@ import React, { useState, useCallback, useMemo, useRef } from "react";
 import * as XLSX from "xlsx";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
-  PieChart, Pie, Cell,
+  PieChart, Pie, Cell, Legend,
 } from "recharts";
 
 // ---------------------------------------------------------------------------
@@ -219,6 +219,42 @@ function findMeta(aoa) {
   return meta;
 }
 
+// ---------------------------------------------------------------------------
+// Laporan Capaian Bulanan (berdasarkan kolom "Tanggal Kunjungan")
+// ---------------------------------------------------------------------------
+const BULAN_ID = ["Jan", "Feb", "Mar", "Apr", "Mei", "Jun", "Jul", "Agu", "Sep", "Okt", "Nov", "Des"];
+
+function parseTanggalKunjungan(v) {
+  if (v == null || v === "") return null;
+  if (v instanceof Date && !isNaN(v)) return v;
+  if (typeof v === "number" && isFinite(v)) {
+    const d = new Date(Math.round((v - 25569) * 86400 * 1000));
+    return isNaN(d.getTime()) ? null : d;
+  }
+  const s = String(v).trim();
+  let m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
+  if (m) {
+    const d = new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]));
+    return isNaN(d.getTime()) ? null : d;
+  }
+  m = s.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})/);
+  if (m) {
+    const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+    return isNaN(d.getTime()) ? null : d;
+  }
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+function monthKey(date) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
+}
+
+function monthLabel(key) {
+  const [y, m] = key.split("-");
+  return `${BULAN_ID[Number(m) - 1]} ${y}`;
+}
+
 function parseWorkbook(aoa) {
   let headerRow = -1;
   let colMap = {};
@@ -251,6 +287,8 @@ function parseWorkbook(aoa) {
     dataStart++;
   }
 
+  const tglIdx = colMap["Tanggal Kunjungan"]; // opsional — boleh tidak ada di beberapa format file
+
   const rows = [];
   for (let i = dataStart; i < aoa.length; i++) {
     const row = aoa[i] || [];
@@ -261,6 +299,7 @@ function parseWorkbook(aoa) {
       kelompokPopulasi: row[colMap["Kelompok Populasi"]] != null ? String(row[colMap["Kelompok Populasi"]]) : "",
       jenisLayanan: row[colMap["Jenis Layanan"]] != null ? String(row[colMap["Jenis Layanan"]]) : "",
       statusOdhiv: row[colMap["Status ODHIV"]] != null ? String(row[colMap["Status ODHIV"]]).trim() : "",
+      tanggalKunjungan: tglIdx != null ? row[tglIdx] : null,
     });
   }
   if (rows.length === 0) {
@@ -271,7 +310,9 @@ function parseWorkbook(aoa) {
 
 function summarize(rows) {
   const byUpk = new Map();
+  const byMonth = new Map();
   let totalOdhiv = 0, totalBelumTahu = 0, totalSpm = 0;
+  let tglTerbaca = 0;
 
   for (const r of rows) {
     if (!byUpk.has(r.upk)) {
@@ -282,16 +323,31 @@ function summarize(rows) {
     if (r.statusOdhiv === "ODHIV") { b.odhiv += 1; totalOdhiv += 1; }
     else if (r.statusOdhiv === "Belum Tahu") { b.belumTahu += 1; totalBelumTahu += 1; }
     else if (r.statusOdhiv === "Bukan ODHIV") { b.bukanOdhiv += 1; }
-    if (isSPM(r.kelompokPopulasi)) { b.spm += 1; totalSpm += 1; }
+    const spm = isSPM(r.kelompokPopulasi);
+    if (spm) { b.spm += 1; totalSpm += 1; }
+
+    const tgl = parseTanggalKunjungan(r.tanggalKunjungan);
+    if (tgl) {
+      tglTerbaca += 1;
+      const key = monthKey(tgl);
+      if (!byMonth.has(key)) byMonth.set(key, { key, label: monthLabel(key), total: 0, spm: 0, nonSpm: 0, odhiv: 0 });
+      const m = byMonth.get(key);
+      m.total += 1;
+      if (spm) m.spm += 1; else m.nonSpm += 1;
+      if (r.statusOdhiv === "ODHIV") m.odhiv += 1;
+    }
   }
 
   const perLayanan = Array.from(byUpk.values()).sort((a, b) => b.total - a.total);
+  const perBulan = Array.from(byMonth.values()).sort((a, b) => a.key.localeCompare(b.key));
   const total = rows.length;
   return {
     total, totalOdhiv, totalBelumTahu, totalSpm,
     totalNonSpm: total - totalSpm,
     layananCount: perLayanan.length,
     perLayanan,
+    perBulan,
+    adaTanggalKunjungan: tglTerbaca > 0,
   };
 }
 
@@ -376,6 +432,21 @@ function buildWorkbook(parsed, summary, targetInfo) {
     targetAoa.push([null, "TOTAL DINKES (KABUPATEN)", summary.totalSpm, totalTargetAll, totalTargetAll ? summary.totalSpm / totalTargetAll : null]);
     const wsTarget = XLSX.utils.aoa_to_sheet(targetAoa);
     XLSX.utils.book_append_sheet(wb, wsTarget, "Capaian SPM vs Target");
+  }
+
+  // Sheet 6: Capaian Bulanan (hanya jika kolom Tanggal Kunjungan terbaca)
+  if (summary.adaTanggalKunjungan && summary.perBulan && summary.perBulan.length) {
+    const targetBulanan = targetInfo ? targetInfo.totalTargetAll / 12 : null;
+    const bulanHeader = ["Bulan", "Total Tes", "Capaian SPM", "Non-SPM", "% SPM"];
+    if (targetBulanan) bulanHeader.push("Target Bulanan", "% Capaian Bulanan");
+    const bulanAoa = [bulanHeader];
+    summary.perBulan.forEach((m) => {
+      const row = [m.label, m.total, m.spm, m.nonSpm, m.total ? m.spm / m.total : 0];
+      if (targetBulanan) row.push(targetBulanan, m.spm / targetBulanan);
+      bulanAoa.push(row);
+    });
+    const wsBulan = XLSX.utils.aoa_to_sheet(bulanAoa);
+    XLSX.utils.book_append_sheet(wb, wsBulan, "Capaian Bulanan");
   }
 
   return wb;
@@ -555,6 +626,11 @@ export default function App() {
       name: r.upk.length > 22 ? r.upk.slice(0, 20) + "…" : r.upk,
       Total: r.total,
     })).reverse();
+  }, [summary]);
+
+  const monthlyChartData = useMemo(() => {
+    if (!summary || !summary.perBulan) return [];
+    return summary.perBulan.map((m) => ({ label: m.label, SPM: m.spm, "Non-SPM": m.nonSpm }));
   }, [summary]);
 
   const pieData = useMemo(() => {
@@ -909,11 +985,78 @@ export default function App() {
               </div>
             </div>
 
+            {/* Laporan Capaian Bulanan (dari kolom Tanggal Kunjungan) */}
+            {summary.adaTanggalKunjungan && summary.perBulan.length > 0 && (
+              <div style={{ background: COLOR.surface, border: `1px solid ${COLOR.line}`, borderRadius: 10, marginTop: 18, padding: "16px 18px" }}>
+                <div style={{ fontSize: 13.5, fontWeight: 600, marginBottom: 2 }}>Laporan Capaian Bulanan</div>
+                <div style={{ fontSize: 12, color: COLOR.inkSoft, marginBottom: 12 }}>
+                  Berdasarkan kolom Tanggal Kunjungan{targetMatch ? " · target bulanan = target SPM tahunan ÷ 12" : ""}.
+                </div>
+
+                <ResponsiveContainer width="100%" height={240}>
+                  <BarChart data={monthlyChartData} margin={{ left: 0, right: 8, top: 4 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke={COLOR.line} vertical={false} />
+                    <XAxis dataKey="label" tick={{ fontSize: 11, fill: COLOR.inkSoft }} />
+                    <YAxis tick={{ fontSize: 11, fill: COLOR.inkSoft }} />
+                    <Tooltip contentStyle={{ fontSize: 12, borderRadius: 6, border: `1px solid ${COLOR.line}` }} />
+                    <Legend wrapperStyle={{ fontSize: 12 }} />
+                    <Bar dataKey="SPM" stackId="a" fill={COLOR.teal} radius={[0, 0, 0, 0]} />
+                    <Bar dataKey="Non-SPM" stackId="a" fill={COLOR.grey} radius={[3, 3, 0, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+
+                <div style={{ overflowX: "auto", marginTop: 14 }}>
+                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12.8 }}>
+                    <thead>
+                      <tr style={{ background: COLOR.greySoft, textAlign: "left" }}>
+                        <th style={{ padding: "9px 12px" }}>Bulan</th>
+                        <th style={{ padding: "9px 12px", textAlign: "right" }}>Total Tes</th>
+                        <th style={{ padding: "9px 12px", textAlign: "right" }}>Capaian SPM</th>
+                        <th style={{ padding: "9px 12px", textAlign: "right" }}>Non-SPM</th>
+                        <th style={{ padding: "9px 12px", textAlign: "right" }}>% SPM</th>
+                        {targetMatch && (
+                          <>
+                            <th style={{ padding: "9px 12px", textAlign: "right" }}>Target Bulanan</th>
+                            <th style={{ padding: "9px 12px", textAlign: "right" }}>% Capaian Bulanan</th>
+                          </>
+                        )}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {summary.perBulan.map((m) => {
+                        const targetBulanan = targetMatch ? targetMatch.totalTargetAll / 12 : null;
+                        const capaianBulanan = targetBulanan ? m.spm / targetBulanan : null;
+                        return (
+                          <tr key={m.key} className="data-row" style={{ borderTop: `1px solid ${COLOR.line}` }}>
+                            <td style={{ padding: "8px 12px" }}>{m.label}</td>
+                            <td style={{ padding: "8px 12px", textAlign: "right", fontFamily: MONO }}>{fmt(m.total)}</td>
+                            <td style={{ padding: "8px 12px", textAlign: "right", fontFamily: MONO }}>{fmt(m.spm)}</td>
+                            <td style={{ padding: "8px 12px", textAlign: "right", fontFamily: MONO, color: COLOR.inkSoft }}>{fmt(m.nonSpm)}</td>
+                            <td style={{ padding: "8px 12px", textAlign: "right", fontFamily: MONO }}>{pct(m.spm, m.total)}</td>
+                            {targetMatch && (
+                              <>
+                                <td style={{ padding: "8px 12px", textAlign: "right", fontFamily: MONO, color: COLOR.inkSoft }}>{fmt(Math.round(targetBulanan))}</td>
+                                <td style={{
+                                  padding: "8px 12px", textAlign: "right", fontFamily: MONO, fontWeight: 600,
+                                  color: capaianBulanan >= 1 ? COLOR.teal : capaianBulanan >= 0.75 ? COLOR.amber : COLOR.coral,
+                                }}>
+                                  {pct(m.spm, targetBulanan)}
+                                </td>
+                              </>
+                            )}
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
             <div style={{ fontSize: 11.5, color: COLOR.inkSoft, marginTop: 12, lineHeight: 1.5 }}>
               Capaian SPM dihitung dari seluruh kelompok populasi di luar Calon Pengantin.
-              {targetMatch
-                ? " File yang diunduh berisi 5 sheet: Data (mentah + kategori SPM), Rekap per Layanan, Rekap Kelompok Populasi, Detail Kelompok Populasi, dan Capaian SPM vs Target."
-                : " File yang diunduh berisi 4 sheet: Data (mentah + kategori SPM), Rekap per Layanan, Rekap Kelompok Populasi, dan Detail Kelompok Populasi. Unggah file target di atas untuk menambahkan sheet Capaian SPM vs Target."}
+              {" "}File yang diunduh berisi sheet: Data (mentah + kategori SPM), Rekap per Layanan, Rekap Kelompok Populasi, Detail Kelompok Populasi{targetMatch ? ", Capaian SPM vs Target" : ""}{summary.adaTanggalKunjungan ? ", Capaian Bulanan" : ""}.
+              {!targetMatch ? " Unggah file target di atas untuk menambahkan sheet Capaian SPM vs Target." : ""}
             </div>
           </>
         )}
