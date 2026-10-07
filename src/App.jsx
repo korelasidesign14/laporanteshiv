@@ -288,6 +288,7 @@ function parseWorkbook(aoa) {
   }
 
   const tglIdx = colMap["Tanggal Kunjungan"]; // opsional — boleh tidak ada di beberapa format file
+  const artIdx = colMap["Tanggal Mulai ART"]; // opsional — terisi berarti ODHIV sudah mulai ART
 
   const rows = [];
   for (let i = dataStart; i < aoa.length; i++) {
@@ -300,6 +301,7 @@ function parseWorkbook(aoa) {
       jenisLayanan: row[colMap["Jenis Layanan"]] != null ? String(row[colMap["Jenis Layanan"]]) : "",
       statusOdhiv: row[colMap["Status ODHIV"]] != null ? String(row[colMap["Status ODHIV"]]).trim() : "",
       tanggalKunjungan: tglIdx != null ? row[tglIdx] : null,
+      tanggalMulaiArt: artIdx != null ? row[artIdx] : null,
     });
   }
   if (rows.length === 0) {
@@ -308,15 +310,20 @@ function parseWorkbook(aoa) {
   return { headerRow, colMap, headerRowRaw: aoa[headerRow], rows, meta: findMeta(aoa) };
 }
 
+function isMulaiArt(v) {
+  return v != null && String(v).trim() !== "";
+}
+
 function summarize(rows) {
   const byUpk = new Map();
   const byMonth = new Map();
-  let totalOdhiv = 0, totalBelumTahu = 0, totalSpm = 0;
+  const byMonthUpk = new Map(); // key: `${monthKey}|${upk}`
+  let totalOdhiv = 0, totalBelumTahu = 0, totalSpm = 0, totalMulaiArt = 0;
   let tglTerbaca = 0;
 
   for (const r of rows) {
     if (!byUpk.has(r.upk)) {
-      byUpk.set(r.upk, { upk: r.upk, total: 0, odhiv: 0, belumTahu: 0, bukanOdhiv: 0, spm: 0 });
+      byUpk.set(r.upk, { upk: r.upk, total: 0, odhiv: 0, belumTahu: 0, bukanOdhiv: 0, spm: 0, mulaiArt: 0 });
     }
     const b = byUpk.get(r.upk);
     b.total += 1;
@@ -325,28 +332,44 @@ function summarize(rows) {
     else if (r.statusOdhiv === "Bukan ODHIV") { b.bukanOdhiv += 1; }
     const spm = isSPM(r.kelompokPopulasi);
     if (spm) { b.spm += 1; totalSpm += 1; }
+    const mulaiArt = isMulaiArt(r.tanggalMulaiArt);
+    if (mulaiArt) { b.mulaiArt += 1; totalMulaiArt += 1; }
 
     const tgl = parseTanggalKunjungan(r.tanggalKunjungan);
     if (tgl) {
       tglTerbaca += 1;
       const key = monthKey(tgl);
-      if (!byMonth.has(key)) byMonth.set(key, { key, label: monthLabel(key), total: 0, spm: 0, nonSpm: 0, odhiv: 0 });
+
+      if (!byMonth.has(key)) byMonth.set(key, { key, label: monthLabel(key), total: 0, spm: 0, nonSpm: 0, odhiv: 0, mulaiArt: 0 });
       const m = byMonth.get(key);
       m.total += 1;
       if (spm) m.spm += 1; else m.nonSpm += 1;
       if (r.statusOdhiv === "ODHIV") m.odhiv += 1;
+      if (mulaiArt) m.mulaiArt += 1;
+
+      const muKey = `${key}|${r.upk}`;
+      if (!byMonthUpk.has(muKey)) {
+        byMonthUpk.set(muKey, { month: key, monthLabel: monthLabel(key), upk: r.upk, total: 0, spm: 0, nonSpm: 0, odhiv: 0, mulaiArt: 0 });
+      }
+      const mu = byMonthUpk.get(muKey);
+      mu.total += 1;
+      if (spm) mu.spm += 1; else mu.nonSpm += 1;
+      if (r.statusOdhiv === "ODHIV") mu.odhiv += 1;
+      if (mulaiArt) mu.mulaiArt += 1;
     }
   }
 
   const perLayanan = Array.from(byUpk.values()).sort((a, b) => b.total - a.total);
   const perBulan = Array.from(byMonth.values()).sort((a, b) => a.key.localeCompare(b.key));
+  const perBulanLayanan = Array.from(byMonthUpk.values());
   const total = rows.length;
   return {
-    total, totalOdhiv, totalBelumTahu, totalSpm,
+    total, totalOdhiv, totalBelumTahu, totalSpm, totalMulaiArt,
     totalNonSpm: total - totalSpm,
     layananCount: perLayanan.length,
     perLayanan,
     perBulan,
+    perBulanLayanan,
     adaTanggalKunjungan: tglTerbaca > 0,
   };
 }
@@ -434,19 +457,34 @@ function buildWorkbook(parsed, summary, targetInfo) {
     XLSX.utils.book_append_sheet(wb, wsTarget, "Capaian SPM vs Target");
   }
 
-  // Sheet 6: Capaian Bulanan (hanya jika kolom Tanggal Kunjungan terbaca)
+  // Sheet 6: Capaian Bulanan — ringkasan Dinkes (hanya jika kolom Tanggal Kunjungan terbaca)
   if (summary.adaTanggalKunjungan && summary.perBulan && summary.perBulan.length) {
-    const targetBulanan = targetInfo ? targetInfo.totalTargetAll / 12 : null;
-    const bulanHeader = ["Bulan", "Total Tes", "Capaian SPM", "Non-SPM", "% SPM"];
-    if (targetBulanan) bulanHeader.push("Target Bulanan", "% Capaian Bulanan");
+    const targetBulananDinkes = targetInfo ? targetInfo.totalTargetAll / 12 : null;
+    const bulanHeader = ["Bulan", "Total Tes", "Capaian SPM", "Non-SPM", "ODHIV", "Mulai ART", "% SPM"];
+    if (targetBulananDinkes) bulanHeader.push("Target Bulanan", "% Capaian Bulanan");
     const bulanAoa = [bulanHeader];
     summary.perBulan.forEach((m) => {
-      const row = [m.label, m.total, m.spm, m.nonSpm, m.total ? m.spm / m.total : 0];
-      if (targetBulanan) row.push(targetBulanan, m.spm / targetBulanan);
+      const row = [m.label, m.total, m.spm, m.nonSpm, m.odhiv, m.mulaiArt, m.total ? m.spm / m.total : 0];
+      if (targetBulananDinkes) row.push(targetBulananDinkes, m.spm / targetBulananDinkes);
       bulanAoa.push(row);
     });
     const wsBulan = XLSX.utils.aoa_to_sheet(bulanAoa);
     XLSX.utils.book_append_sheet(wb, wsBulan, "Capaian Bulanan");
+
+    // Sheet 7: Capaian Bulanan per Layanan (rincian tiap layanan, tiap bulan)
+    const bulanLayananHeader = ["Bulan", "Nama UPK / Layanan", "Total Tes", "Capaian SPM", "Non-SPM", "ODHIV", "Mulai ART"];
+    if (targetInfo) bulanLayananHeader.push("Target Bulanan", "% Capaian");
+    const bulanLayananAoa = [bulanLayananHeader];
+    const sortedMonthly = [...summary.perBulanLayanan].sort((a, b) => a.month.localeCompare(b.month) || b.total - a.total);
+    sortedMonthly.forEach((r) => {
+      const t = targetInfo ? targetInfo.byFacility.get(r.upk) : null;
+      const targetBulananLayanan = t ? t.total / 12 : null;
+      const row = [r.monthLabel, r.upk, r.total, r.spm, r.nonSpm, r.odhiv, r.mulaiArt];
+      if (targetInfo) row.push(targetBulananLayanan, targetBulananLayanan ? r.spm / targetBulananLayanan : null);
+      bulanLayananAoa.push(row);
+    });
+    const wsBulanLayanan = XLSX.utils.aoa_to_sheet(bulanLayananAoa);
+    XLSX.utils.book_append_sheet(wb, wsBulanLayanan, "Capaian Bulanan per Layanan");
   }
 
   return wb;
@@ -509,6 +547,8 @@ export default function App() {
   const [query, setQuery] = useState("");
   const [dragOver, setDragOver] = useState(false);
   const fileInputRef = useRef(null);
+
+  const [selectedMonth, setSelectedMonth] = useState(null);
 
   const [targetRows, setTargetRows] = useState(null);
   const [targetFileName, setTargetFileName] = useState("");
@@ -632,6 +672,24 @@ export default function App() {
     if (!summary || !summary.perBulan) return [];
     return summary.perBulan.map((m) => ({ label: m.label, SPM: m.spm, "Non-SPM": m.nonSpm }));
   }, [summary]);
+
+  const selectedMonthEffective = useMemo(() => {
+    if (!summary || !summary.perBulan.length) return null;
+    if (selectedMonth && summary.perBulan.some((m) => m.key === selectedMonth)) return selectedMonth;
+    return summary.perBulan[summary.perBulan.length - 1].key;
+  }, [summary, selectedMonth]);
+
+  const selectedMonthSummary = useMemo(() => {
+    if (!summary || !selectedMonthEffective) return null;
+    return summary.perBulan.find((m) => m.key === selectedMonthEffective) || null;
+  }, [summary, selectedMonthEffective]);
+
+  const monthlyLayananRows = useMemo(() => {
+    if (!summary || !selectedMonthEffective) return [];
+    return summary.perBulanLayanan
+      .filter((r) => r.month === selectedMonthEffective)
+      .sort((a, b) => b.total - a.total);
+  }, [summary, selectedMonthEffective]);
 
   const pieData = useMemo(() => {
     if (!summary) return [];
@@ -985,15 +1043,16 @@ export default function App() {
               </div>
             </div>
 
-            {/* Laporan Capaian Bulanan (dari kolom Tanggal Kunjungan) */}
+            {/* Laporan Capaian Bulanan per Layanan (dari kolom Tanggal Kunjungan) */}
             {summary.adaTanggalKunjungan && summary.perBulan.length > 0 && (
               <div style={{ background: COLOR.surface, border: `1px solid ${COLOR.line}`, borderRadius: 10, marginTop: 18, padding: "16px 18px" }}>
-                <div style={{ fontSize: 13.5, fontWeight: 600, marginBottom: 2 }}>Laporan Capaian Bulanan</div>
+                <div style={{ fontSize: 13.5, fontWeight: 600, marginBottom: 2 }}>Laporan Capaian Bulanan per Layanan</div>
                 <div style={{ fontSize: 12, color: COLOR.inkSoft, marginBottom: 12 }}>
-                  Berdasarkan kolom Tanggal Kunjungan{targetMatch ? " · target bulanan = target SPM tahunan ÷ 12" : ""}.
+                  Berdasarkan kolom Tanggal Kunjungan. "Mulai ART" dihitung dari kolom Tanggal Mulai ART — terisi berarti ODHIV tsb sudah mulai ART.
+                  {targetMatch ? " Target bulanan per layanan = target SPM tahunan layanan ÷ 12." : ""}
                 </div>
 
-                <ResponsiveContainer width="100%" height={240}>
+                <ResponsiveContainer width="100%" height={220}>
                   <BarChart data={monthlyChartData} margin={{ left: 0, right: 8, top: 4 }}>
                     <CartesianGrid strokeDasharray="3 3" stroke={COLOR.line} vertical={false} />
                     <XAxis dataKey="label" tick={{ fontSize: 11, fill: COLOR.inkSoft }} />
@@ -1005,42 +1064,67 @@ export default function App() {
                   </BarChart>
                 </ResponsiveContainer>
 
-                <div style={{ overflowX: "auto", marginTop: 14 }}>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap", marginTop: 16, marginBottom: 10 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <span style={{ fontSize: 12.5, fontWeight: 600, color: COLOR.inkSoft }}>Pilih bulan:</span>
+                    <select
+                      value={selectedMonthEffective || ""}
+                      onChange={(e) => setSelectedMonth(e.target.value)}
+                      style={{ border: `1px solid ${COLOR.line}`, borderRadius: 7, padding: "7px 10px", fontSize: 12.5, fontFamily: SANS, background: COLOR.surface }}
+                    >
+                      {summary.perBulan.map((m) => (
+                        <option key={m.key} value={m.key}>{m.label}</option>
+                      ))}
+                    </select>
+                  </div>
+                  {selectedMonthSummary && (
+                    <div style={{ fontSize: 12, color: COLOR.inkSoft }}>
+                      {selectedMonthSummary.label}: {fmt(selectedMonthSummary.total)} tes · {fmt(selectedMonthSummary.spm)} SPM · {fmt(selectedMonthSummary.odhiv)} ODHIV · {fmt(selectedMonthSummary.mulaiArt)} mulai ART
+                    </div>
+                  )}
+                </div>
+
+                <div style={{ overflowX: "auto" }}>
                   <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12.8 }}>
                     <thead>
                       <tr style={{ background: COLOR.greySoft, textAlign: "left" }}>
-                        <th style={{ padding: "9px 12px" }}>Bulan</th>
+                        <th style={{ padding: "9px 12px" }}>Layanan</th>
                         <th style={{ padding: "9px 12px", textAlign: "right" }}>Total Tes</th>
                         <th style={{ padding: "9px 12px", textAlign: "right" }}>Capaian SPM</th>
                         <th style={{ padding: "9px 12px", textAlign: "right" }}>Non-SPM</th>
-                        <th style={{ padding: "9px 12px", textAlign: "right" }}>% SPM</th>
+                        <th style={{ padding: "9px 12px", textAlign: "right" }}>ODHIV</th>
+                        <th style={{ padding: "9px 12px", textAlign: "right" }}>Mulai ART</th>
                         {targetMatch && (
                           <>
                             <th style={{ padding: "9px 12px", textAlign: "right" }}>Target Bulanan</th>
-                            <th style={{ padding: "9px 12px", textAlign: "right" }}>% Capaian Bulanan</th>
+                            <th style={{ padding: "9px 12px", textAlign: "right" }}>% Capaian</th>
                           </>
                         )}
                       </tr>
                     </thead>
                     <tbody>
-                      {summary.perBulan.map((m) => {
-                        const targetBulanan = targetMatch ? targetMatch.totalTargetAll / 12 : null;
-                        const capaianBulanan = targetBulanan ? m.spm / targetBulanan : null;
+                      {monthlyLayananRows.map((r) => {
+                        const t = targetMatch ? targetMatch.byFacility.get(r.upk) : null;
+                        const targetBulanan = t ? t.total / 12 : null;
+                        const capaianBulanan = targetBulanan ? r.spm / targetBulanan : null;
                         return (
-                          <tr key={m.key} className="data-row" style={{ borderTop: `1px solid ${COLOR.line}` }}>
-                            <td style={{ padding: "8px 12px" }}>{m.label}</td>
-                            <td style={{ padding: "8px 12px", textAlign: "right", fontFamily: MONO }}>{fmt(m.total)}</td>
-                            <td style={{ padding: "8px 12px", textAlign: "right", fontFamily: MONO }}>{fmt(m.spm)}</td>
-                            <td style={{ padding: "8px 12px", textAlign: "right", fontFamily: MONO, color: COLOR.inkSoft }}>{fmt(m.nonSpm)}</td>
-                            <td style={{ padding: "8px 12px", textAlign: "right", fontFamily: MONO }}>{pct(m.spm, m.total)}</td>
+                          <tr key={r.upk} className="data-row" style={{ borderTop: `1px solid ${COLOR.line}` }}>
+                            <td style={{ padding: "8px 12px", maxWidth: 240 }}>{r.upk}</td>
+                            <td style={{ padding: "8px 12px", textAlign: "right", fontFamily: MONO }}>{fmt(r.total)}</td>
+                            <td style={{ padding: "8px 12px", textAlign: "right", fontFamily: MONO }}>{fmt(r.spm)}</td>
+                            <td style={{ padding: "8px 12px", textAlign: "right", fontFamily: MONO, color: COLOR.inkSoft }}>{fmt(r.nonSpm)}</td>
+                            <td style={{ padding: "8px 12px", textAlign: "right", fontFamily: MONO, color: r.odhiv ? COLOR.coral : COLOR.inkSoft }}>{fmt(r.odhiv)}</td>
+                            <td style={{ padding: "8px 12px", textAlign: "right", fontFamily: MONO, color: r.mulaiArt ? COLOR.teal : COLOR.inkSoft }}>{fmt(r.mulaiArt)}</td>
                             {targetMatch && (
                               <>
-                                <td style={{ padding: "8px 12px", textAlign: "right", fontFamily: MONO, color: COLOR.inkSoft }}>{fmt(Math.round(targetBulanan))}</td>
+                                <td style={{ padding: "8px 12px", textAlign: "right", fontFamily: MONO, color: COLOR.inkSoft }}>
+                                  {targetBulanan != null ? fmt(Math.round(targetBulanan)) : "–"}
+                                </td>
                                 <td style={{
                                   padding: "8px 12px", textAlign: "right", fontFamily: MONO, fontWeight: 600,
-                                  color: capaianBulanan >= 1 ? COLOR.teal : capaianBulanan >= 0.75 ? COLOR.amber : COLOR.coral,
+                                  color: capaianBulanan == null ? COLOR.inkSoft : capaianBulanan >= 1 ? COLOR.teal : capaianBulanan >= 0.75 ? COLOR.amber : COLOR.coral,
                                 }}>
-                                  {pct(m.spm, targetBulanan)}
+                                  {capaianBulanan != null ? pct(r.spm, targetBulanan) : "–"}
                                 </td>
                               </>
                             )}
@@ -1055,7 +1139,7 @@ export default function App() {
 
             <div style={{ fontSize: 11.5, color: COLOR.inkSoft, marginTop: 12, lineHeight: 1.5 }}>
               Capaian SPM dihitung dari seluruh kelompok populasi di luar Calon Pengantin.
-              {" "}File yang diunduh berisi sheet: Data (mentah + kategori SPM), Rekap per Layanan, Rekap Kelompok Populasi, Detail Kelompok Populasi{targetMatch ? ", Capaian SPM vs Target" : ""}{summary.adaTanggalKunjungan ? ", Capaian Bulanan" : ""}.
+              {" "}File yang diunduh berisi sheet: Data (mentah + kategori SPM), Rekap per Layanan, Rekap Kelompok Populasi, Detail Kelompok Populasi{targetMatch ? ", Capaian SPM vs Target" : ""}{summary.adaTanggalKunjungan ? ", Capaian Bulanan, dan Capaian Bulanan per Layanan" : ""}.
               {!targetMatch ? " Unggah file target di atas untuk menambahkan sheet Capaian SPM vs Target." : ""}
             </div>
           </>
